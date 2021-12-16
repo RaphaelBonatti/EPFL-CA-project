@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -7,218 +8,163 @@
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
-void *choose_copy(shared_t shared, size_t segment_index, size_t word_index,
-                  bool writeable, bool valid) {
-  struct Region *reg = (struct Region *)shared;
-
-  // Writeable/Valid   0     | 1
-  //                0 first | second
-  //                1 second| first
-  if (valid == writeable) {
-    return reg->segments[segment_index] + word_index;
-  }
-
-  return reg->segments_copy[segment_index] + word_index;
-}
-
-void read_word_at_index(shared_t shared, void *target, size_t segment_index,
-                        size_t word_index, bool valid) {
-  struct Region *reg = (struct Region *)shared;
-  void *word = choose_copy(shared, segment_index, word_index, false, valid);
-  size_t offset = word_index * reg->align;
-
-  memcpy(target + offset, word, reg->align);
-}
-
 bool read_word(shared_t shared, tx_t tx, void *target, size_t segment_index,
-               size_t word_index) {
+               size_t word_index)
+{
   struct Region *reg = (struct Region *)shared;
-  struct Control control = reg->controls[segment_index][word_index];
+  struct Control *control = &reg->controls[segment_index][word_index];
+  struct Transaction *tr = (struct Transaction *)tx;
 
-  if (tx == read_only_tx) {
-    // TODO: read
-    read_word_at_index(shared, target, segment_index, word_index,
-                       control.valid);
+  if (tr->is_ro)
+  {
+    void *word =
+        (char *)reg->segments_read[segment_index] + word_index * reg->align;
+    memcpy(target, word, reg->align);
+
     return true;
   }
 
-  // the word has been written in the current epoch
-  if (control.written) {
-    // no transaction in access set
-    if (!control.access_set) {
-      read_word_at_index(shared, target, segment_index, word_index,
-                         control.valid);
+  pthread_mutex_lock(&reg->batcher.read_lock);
+
+  if (control->written == reg->batcher.epoch)
+  {
+    if ((control->accessed_epoch == reg->batcher.epoch) &&
+        (control->access_set == tr->id))
+    {
+      memcpy(target, control->write_word, reg->align);
+      pthread_mutex_unlock(&reg->batcher.read_lock);
       return true;
     }
-
+    pthread_mutex_unlock(&reg->batcher.read_lock);
     return false;
   }
 
-  read_word_at_index(shared, target, segment_index, word_index, control.valid);
-  // add the transaction into the \access set" (if not already in);
-  // what is a transaction, an id?
-  control.access_set = tx;
+  if (control->accessed_epoch != reg->batcher.epoch)
+  {
+    control->accessed_epoch = reg->batcher.epoch;
+    pthread_mutex_unlock(&reg->batcher.read_lock);
+    control->access_set = tr->id;
+
+    control->write_word =
+        (char *)reg->segments_write[segment_index] + word_index * reg->align;
+    control->read_word =
+        (char *)reg->segments_read[segment_index] + word_index * reg->align;
+    insert_list(&tr->accessed_words, control, struct Control *);
+  }
+  else
+  {
+    pthread_mutex_unlock(&reg->batcher.read_lock);
+  }
+
+  memcpy(target, control->read_word, reg->align);
+
   return true;
 }
 
-// bool read(shared_t shared, tx_t tx, void const *source, size_t size,
-//           void *target) {
-//   size_t word_index = WORD_INDEX(source);
-//   size_t segment_index = SEGMENT_INDEX(source);
-
-//   for (size_t i = word_index; i < word_index + size; ++i) {
-//     bool result = read_word(shared, tx, target, segment_index, word_index);
-//     if (!result) {
-//       return false;
-//     }
-//   }
-//   return true;
-// }
-
-void write_word_at_index(shared_t shared, void const *source,
-                         size_t segment_index, size_t word_index, bool valid) {
-  struct Region *reg = (struct Region *)shared;
-  void *word = choose_copy(shared, segment_index, word_index, true, valid);
-  uintptr_t offset = word_index * reg->align;
-
-  memcpy(word, source + offset, reg->align);
-}
-
 bool write_word(shared_t shared, tx_t tx, void const *source,
-                size_t segment_index, size_t word_index) {
+                size_t segment_index, size_t word_index)
+{
   struct Region *reg = (struct Region *)shared;
-  struct Control control = reg->controls[segment_index][word_index];
+  struct Control *control = &reg->controls[segment_index][word_index];
+  struct Transaction *tr = (struct Transaction *)tx;
 
-  if (control.written) {
-    // if the transaction is already in the access set
-    if (control.access_set == tx) {
-      write_word_at_index(shared, source, segment_index, word_index,
-                          control.valid);
-
+  pthread_mutex_lock(&reg->batcher.write_lock);
+  if (control->written == reg->batcher.epoch)
+  {
+    // Check if can be accessed by current tx
+    if ((control->accessed_epoch == reg->batcher.epoch) &&
+        (control->access_set == tr->id))
+    {
+      pthread_mutex_unlock(&reg->batcher.write_lock);
+      memcpy(control->write_word, source, reg->align);
       return true;
     }
-
+    pthread_mutex_unlock(&reg->batcher.write_lock);
     return false;
   }
 
   // if at least one other transaction is in the access set
-  if (control.access_set != 0 && control.access_set != tx) {
+  if ((control->accessed_epoch == reg->batcher.epoch) &&
+      (control->access_set != tr->id))
+  {
+    pthread_mutex_unlock(&reg->batcher.write_lock);
     return false;
   }
 
-  // write source into writable
-  write_word_at_index(shared, source, segment_index, word_index, control.valid);
+  if (control->accessed_epoch != reg->batcher.epoch)
+  {
+    control->accessed_epoch = reg->batcher.epoch;
+    control->access_set = tr->id;
 
-  // add the transaction into the \access set" (if not already in);
-  control.access_set = tx;
+    control->write_word =
+        (char *)reg->segments_write[segment_index] + word_index * reg->align;
+    control->read_word =
+        (char *)reg->segments_read[segment_index] + word_index * reg->align;
 
-  // mark that the word has been written in the current epoch;
-  control.written = true;
+    insert_list(&tr->accessed_words, control, struct Control *);
+  }
+  control->written = reg->batcher.epoch;
+  pthread_mutex_unlock(&reg->batcher.write_lock);
+  memcpy(control->write_word, source, reg->align);
+
   return true;
 }
 
-// bool write(shared_t shared, tx_t tx, void const *source, size_t size,
-//            void *target) {
-//   size_t word_index = WORD_INDEX(target);
-//   size_t segment_index = SEGMENT_INDEX(target);
-
-//   for (size_t i = word_index; i < word_index + size; ++i) {
-//     bool result = write_word(shared, tx, source, segment_index, i);
-//     if (!result) {
-//       return false;
-//     }
-//   }
-//   return true;
-// }
-
-// shared_t create(size_t size, size_t align) {
-//   struct Region *reg = (struct Region *)malloc(sizeof(struct Region));
-
-//   if (unlikely(!reg)) {
-//     return invalid_shared;
-//   }
-
-//   init_batcher(&reg->batcher);
-
-//   // Set the pointers to segments to NULL
-//   memset(reg->segments, 0, MAX_SEGMENTS);
-//   memset(reg->segments_copy, 0, MAX_SEGMENTS);
-
-//   // Try to allocate the aligned memory for the first segment
-//   if (posix_memalign(&(reg->segments[0]), align, size) != 0 ||
-//       posix_memalign(&(reg->segments_copy[0]), align, size) != 0) {
-//     free(reg);
-//     return invalid_shared;
-//   }
-
-//   // Set the segment memory to 0
-//   memset(reg->segments[0], 0, size);
-//   memset(reg->segments_copy[0], 0, size);
-
-//   // Initialize the control struct (set everything to 0)
-//   reg->controls[0] = calloc(size / align, sizeof(struct Control));
-
-//   // Initialize the region fields
-//   reg->n_segments = 1; // the index of next segment to allocate
-//   reg->size = size;
-//   reg->align = align;
-
-//   return reg;
-// }
-
-uintptr_t next_free(shared_t shared) {
+uintptr_t next_free(shared_t shared)
+{
   struct Region *reg = (struct Region *)shared;
 
   // Take the next available index O(1) time if the number of allocations is
   // less than the maximum. Index go from 0 to MAX_SEGMENTS - 1
-  if (reg->n_segments < MAX_SEGMENTS) {
-    return reg->n_segments + 1;
+  if (reg->n_segments < MAX_SEGMENTS)
+  {
+    return atomic_fetch_add(&reg->n_segments, 1);
   }
 
   // Search the first index with non allocated segment. O(n) time.
   unsigned int i = 0;
-  while (reg->segments[i] != NULL) {
+  while (reg->segments_write[i] != NULL)
+  {
     ++i;
   }
 
   return i;
 }
 
-// alloc_t alloc(shared_t shared, tx_t tx, size_t size, void **target) {
-//   struct Region *reg = (struct Region *)shared;
-//   uintptr_t index = next_free(shared);
+void seg_free(shared_t shared, uintptr_t index)
+{
+  struct Region *reg = (struct Region *)shared;
 
-//   if (posix_memalign((void **)&(reg->segments[index]), reg->align, size) != 0
-//   ||
-//       posix_memalign((void **)&(reg->segments_copy[index]), reg->align, size)
-//       !=
-//           0) {
-//     return nomem_alloc;
-//   }
+  free(reg->segments_write[index]);
+  free(reg->segments_read[index]);
+  free(reg->controls[index]);
 
-//   memset(reg->segments[index], 0, size);
-//   memset(reg->segments_copy[index], 0, size);
+  // To indicate a free index
+  reg->segments_write[index] = NULL;
+  reg->segments_read[index] = NULL;
+  reg->controls[index] = NULL;
+}
 
-//   // Allocate control structre
-//   reg->controls[index] = calloc(size / reg->align, sizeof(struct Control));
+void commit(shared_t shared)
+{
+  struct Region *reg = (struct Region *)shared;
+  struct Control *control = NULL;
 
-//   *target = (void *)(index << 48);
+  for (size_t i = 0; i < reg->modified_controls.n; ++i)
+  {
+    control = get_list(&reg->modified_controls, i, struct Control *);
 
-//   ++reg->n_segments;
+    if (control->written == reg->batcher.epoch)
+    {
+      memcpy(control->read_word, control->write_word, reg->align);
+    }
+  }
 
-//   return success_alloc;
-// }
+  (&reg->modified_controls)->n = 0;
 
-// bool tm_free(shared_t shared, tx_t tx, void *target) {
-//   struct Region *reg = (struct Region *)shared;
-//   uintptr_t index = SEGMENT_INDEX(target);
-
-//   free(reg->segments[index]);
-//   free(reg->segments_copy[index]);
-//   free(reg->controls[index]);
-
-//   // To indicate a free index
-//   reg->segments[index] = NULL;
-
-//   return false;
-// }
+  for (size_t i = 0; i < reg->freed_segments.n; ++i)
+  {
+    uintptr_t index = get_list(&reg->freed_segments, i, uintptr_t);
+    seg_free(shared, index);
+  }
+}

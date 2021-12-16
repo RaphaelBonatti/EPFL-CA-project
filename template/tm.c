@@ -1,6 +1,6 @@
 /**
  * @file   tm.c
- * @author [...]
+ * @author Raphael Bonatti
  *
  * @section LICENSE
  *
@@ -20,13 +20,8 @@
 #error Current C11 compiler does not support atomic operations
 #endif
 
-#define CHECK_TX(X, VAL)                                                       \
-  if (((X) != read_only_tx) &&                                                 \
-      unlikely(((struct Transaction *)(X))->shared != shared)) {               \
-    return (VAL);                                                              \
-  }
-
 // External headers
+#include <stdio.h> // for debug purposes
 #include <stdlib.h>
 #include <string.h>
 
@@ -44,36 +39,44 @@
  *memory region must support
  * @return Opaque shared memory region handle, 'invalid_shared' on failure
  **/
-shared_t tm_create(size_t size, size_t align) {
-  struct Region *reg = (struct Region *)malloc(sizeof(struct Region));
+shared_t tm_create(size_t size, size_t align)
+{
+  struct Region *reg = (struct Region *)calloc(1, sizeof(struct Region));
 
-  if (unlikely(!reg)) {
+  if (unlikely(!reg))
+  {
+    printf("Error: Could not allocate memory.\n");
+    free(reg);
     return invalid_shared;
   }
 
   init_batcher(&reg->batcher);
 
-  // Set the pointers to segments to NULL
-  memset(reg->segments, 0, MAX_SEGMENTS * sizeof(void *));
-  memset(reg->segments_copy, 0, MAX_SEGMENTS * sizeof(void *));
-
   // Try to allocate the aligned memory for the first segment
-  if (posix_memalign(&(reg->segments[0]), align, size) != 0 ||
-      posix_memalign(&(reg->segments_copy[0]), align, size) != 0) {
+  if (unlikely(posix_memalign(&(reg->segments_write[0]), align, size) != 0 ||
+               posix_memalign(&(reg->segments_read[0]), align, size) != 0))
+  {
     free(reg);
     return invalid_shared;
   }
 
   // Set the segment memory to 0
-  memset(reg->segments[0], 0, size);
-  memset(reg->segments_copy[0], 0, size);
+  memset(reg->segments_write[0], 0, size);
+  memset(reg->segments_read[0], 0, size);
 
   // Initialize the control struct (set everything to 0)
-  reg->controls[0] = calloc(size / align, sizeof(struct Control));
+  reg->controls[0] = (struct Control *)calloc(size / align, sizeof(struct Control));
+
+  init_list(&reg->modified_controls, sizeof(struct Control *));
+  init_list(&reg->freed_segments, sizeof(uintptr_t));
+
+  pthread_mutex_init(&reg->modified_controls_lock, NULL);
+  pthread_mutex_init(&reg->freed_segments_lock, NULL);
 
   // Initialize the region fields
   reg->n_segments = 1; // the index of next segment to allocate
-  memset(reg->size, 0, MAX_SEGMENTS * sizeof(size_t));
+  // memset(reg->size, 0, MAX_SEGMENTS * sizeof(size_t));
+  // memset(reg->to_free, 0, MAX_SEGMENTS);
   reg->size[0] = size;
   reg->align = align;
 
@@ -83,8 +86,37 @@ shared_t tm_create(size_t size, size_t align) {
 /** Destroy (i.e. clean-up + free) a given shared memory region.
  * @param shared Shared memory region to destroy, with no running transaction
  **/
-void tm_destroy(shared_t unused(shared)) {
-  // TODO: tm_destroy(shared_t)
+void tm_destroy(shared_t shared)
+{
+  struct Region *reg = (struct Region *)shared;
+
+  batcher_destroy(&reg->batcher);
+
+  size_t seg = 1;
+
+  while (seg < MAX_SEGMENTS)
+  {
+    if (reg->controls[seg] != NULL)
+    {
+      free(reg->segments_write[seg]);
+      free(reg->segments_read[seg]);
+      free(reg->controls[seg]);
+    }
+
+    ++seg;
+  }
+
+  free(reg->segments_write[0]);
+  free(reg->segments_read[0]);
+  free(reg->controls[0]);
+
+  destroy_list(&reg->freed_segments);
+  destroy_list(&reg->modified_controls);
+
+  pthread_mutex_destroy(&reg->modified_controls_lock);
+  pthread_mutex_destroy(&reg->freed_segments_lock);
+
+  free(reg);
 }
 
 /** [thread-safe] Return the start address of the first allocated segment in the
@@ -113,26 +145,29 @@ size_t tm_align(shared_t shared) { return ((struct Region *)shared)->align; }
  * @param is_ro  Whether the transaction is read-only
  * @return Opaque transaction ID, 'invalid_tx' on failure
  **/
-tx_t tm_begin(shared_t shared, bool is_ro) {
+tx_t tm_begin(shared_t shared, bool is_ro)
+{
   struct Region *reg = (struct Region *)shared;
+  struct Transaction *tr = (struct Transaction *)calloc(1, sizeof(struct Transaction));
+
+  if (unlikely(tr == NULL))
+  {
+    free(tr);
+    return invalid_tx;
+  }
+
+  // Unique transaction defined by id and shared
+  tr->id = atomic_fetch_add(&reg->batcher.tx_count, 1);
+  tr->is_ro = is_ro;
+  tr->is_aborted = 0;
+  // tr->shared = shared;
+  init_list(&tr->alloced_segments, sizeof(uintptr_t));
+  init_list(&tr->freed_segments, sizeof(uintptr_t));
+  init_list(&tr->accessed_words, sizeof(struct Control *));
 
   enter(&reg->batcher);
 
-  if (is_ro) {
-    return read_only_tx;
-  } else {
-    struct Transaction *tr = malloc(sizeof(struct Transaction));
-
-    if (tr == NULL) {
-      return invalid_tx;
-    }
-
-    // Unique transaction defined by id and shared
-    tr->id = atomic_fetch_add(&reg->batcher.tx_count, 1);
-    tr->shared = shared;
-
-    return (uintptr_t)tr;
-  }
+  return (uintptr_t)tr;
 }
 
 /** [thread-safe] End the given transaction.
@@ -140,49 +175,64 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
  * @param tx     Transaction to end
  * @return Whether the whole transaction committed
  **/
-bool tm_end(shared_t shared, tx_t tx) {
-  CHECK_TX(tx, false);
-
+bool tm_end(shared_t shared, tx_t tx)
+{
   struct Region *reg = (struct Region *)shared;
+  struct Transaction *tr = (struct Transaction *)tx;
+  struct Control *control;
+  uintptr_t index;
 
-  // FIXME: What if an adversary uses this tx several times
-  // should I store the tx somewhere?
-  if (tx == read_only_tx) {
-    leave(&reg->batcher);
-    return true;
-  }
-
-  leave(&reg->batcher);
-
-  // Last transaction, then must swap written words valid status
-  // TODO: fix this bottleneck: Could save the address of control variables
-  // or keep track of accessed segments
-  if (reg->batcher.remaining == 0) {
-    size_t remaining_to_check = reg->n_segments;
-    size_t seg = 0;
-    while (remaining_to_check > 0) {
-      while (reg->controls[seg] == NULL) {
-        ++seg;
-      }
-
-      for (size_t word = 0; word < reg->size[seg]; ++word) {
-        reg->controls[seg][word].access_set = 0;
-
-        if (reg->controls[seg][word].written) {
-          reg->controls[seg][word].valid = !reg->controls[seg][word].valid;
-          reg->controls[seg][word].written = 0;
-        }
-      }
-
-      --remaining_to_check;
+  if (unlikely(tr->is_aborted))
+  {
+    // Must undo writes and reads
+    for (size_t i = 0; i < tr->accessed_words.n; ++i)
+    {
+      control = get_list(&tr->accessed_words, i, struct Control *);
+      control->written = 0; // TODO: even if read?
+      control->accessed_epoch = 0;
     }
 
-    pthread_cond_broadcast(&reg->batcher.empty);
+    // Must free allocated segments
+    for (size_t i = 0; i < tr->alloced_segments.n; ++i)
+    {
+      index = get_list(&tr->alloced_segments, i, uintptr_t);
+      atomic_fetch_sub(&reg->n_segments, 1);
+      seg_free(shared, index);
+    }
+  }
+  else
+  {
+    if (tr->freed_segments.n > 0)
+    {
+      pthread_mutex_lock(&reg->freed_segments_lock);
+      for (size_t i = 0; i < tr->freed_segments.n; ++i)
+      {
+        index = get_list(&tr->freed_segments, i, uintptr_t);
+        insert_list(&reg->freed_segments, index, uintptr_t);
+      }
+      pthread_mutex_unlock(&reg->freed_segments_lock);
+    }
 
-    pthread_mutex_unlock(&reg->batcher.lock);
+    // Commit your acessed words
+    pthread_mutex_lock(&reg->modified_controls_lock);
+    for (size_t i = 0; i < tr->accessed_words.n; ++i)
+    {
+      control = get_list(&tr->accessed_words, i, struct Control *);
+
+      insert_list(&reg->modified_controls, control, struct Control *);
+    }
+    pthread_mutex_unlock(&reg->modified_controls_lock);
+
+    // Mark to  free segments
   }
 
-  free((struct Transaction *)tx);
+  leave(&reg->batcher, commit, shared);
+
+  // Clean up tx
+  destroy_list(&tr->alloced_segments);
+  destroy_list(&tr->freed_segments);
+  destroy_list(&tr->accessed_words);
+  free(tr);
 
   return true;
 }
@@ -198,18 +248,25 @@ bool tm_end(shared_t shared, tx_t tx) {
  * @return Whether the whole transaction can continue
  **/
 bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size,
-             void *target) {
-  CHECK_TX(tx, false);
+             void *target)
+{
+  struct Region *reg = (struct Region *)shared;
 
   size_t word_index = WORD_INDEX(source);
   size_t segment_index = SEGMENT_INDEX(source);
 
-  for (size_t i = word_index; i < word_index + size; ++i) {
-    bool result = read_word(shared, tx, target, segment_index, word_index);
-    if (!result) {
+  for (size_t i = 0; i < size / reg->align; ++i)
+  {
+    bool result = read_word(shared, tx, ((char *)target + i * reg->align), segment_index,
+                            word_index + i);
+    if (!result)
+    {
+      ((struct Transaction *)tx)->is_aborted = 1;
+      tm_end(shared, tx);
       return false;
     }
   }
+
   return true;
 }
 
@@ -224,18 +281,30 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size,
  * @return Whether the whole transaction can continue
  **/
 bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size,
-              void *target) {
-  CHECK_TX(tx, false);
+              void *target)
+{
+  struct Region *reg = (struct Region *)shared;
+  // struct Transaction *tr = (struct Transaction *)tx;
 
   size_t word_index = WORD_INDEX(target);
   size_t segment_index = SEGMENT_INDEX(target);
 
-  for (size_t i = word_index; i < word_index + size; ++i) {
-    bool result = write_word(shared, tx, source, segment_index, i);
-    if (!result) {
+  size_t i;
+  for (i = 0; i < size / reg->align; ++i)
+  {
+
+    bool result = write_word(shared, tx, ((char *)source + i * reg->align), segment_index,
+                             word_index + i);
+
+    if (!result)
+    {
+      ((struct Transaction *)tx)->is_aborted = 1;
+      tm_end(shared, tx);
+
       return false;
     }
   }
+
   return true;
 }
 
@@ -249,27 +318,46 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size,
  * @return Whether the whole transaction can continue (success/nomem), or not
  *(abort_alloc)
  **/
-alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target) {
-  CHECK_TX(tx, abort_alloc);
-
+alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
+{
   struct Region *reg = (struct Region *)shared;
-  uintptr_t index = next_free(shared);
+  struct Transaction *tr = (struct Transaction *)tx;
+  // printf("Tx: %ld Alloc\n", tr->id);
 
-  if (posix_memalign((void **)&(reg->segments[index]), reg->align, size) != 0 ||
-      posix_memalign((void **)&(reg->segments_copy[index]), reg->align, size) !=
-          0) {
+  pthread_mutex_lock(&reg->batcher.alloc_lock);
+  uintptr_t index = next_free(shared);
+  ++reg->n_segments;
+  pthread_mutex_unlock(&reg->batcher.alloc_lock);
+
+  if (unlikely(tr->is_aborted))
+  {
+    atomic_fetch_sub(&reg->n_segments, 1);
+    return abort_alloc;
+  }
+
+  if (unlikely(posix_memalign((void **)&(reg->segments_write[index]),
+                              reg->align, size) != 0 ||
+               posix_memalign((void **)&(reg->segments_read[index]), reg->align,
+                              size) != 0))
+  {
+    atomic_fetch_sub(&reg->n_segments, 1);
     return nomem_alloc;
   }
 
-  memset(reg->segments[index], 0, size);
-  memset(reg->segments_copy[index], 0, size);
+  memset(reg->segments_write[index], 0, size);
+  memset(reg->segments_read[index], 0, size);
 
   // Allocate control structre
-  reg->controls[index] = calloc(size / reg->align, sizeof(struct Control));
+  reg->controls[index] = (struct Control *)calloc(size / reg->align, sizeof(struct Control));
 
-  *target = (void *)(index << 48);
+  // We add one because we start a 1, the first segment was allocated at
+  // creation of the shared memory.
+  *target = (void *)((index + 1) << 48);
+  reg->size[index] = size;
 
-  ++reg->n_segments;
+  // pthread_mutex_lock(&reg->batcher.alloc_lock);
+  insert_list(&tr->alloced_segments, index, uintptr_t);
+  // pthread_mutex_unlock(&reg->batcher.alloc_lock);
 
   return success_alloc;
 }
@@ -281,20 +369,23 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target) {
  *to deallocate
  * @return Whether the whole transaction can continue
  **/
-bool tm_free(shared_t shared, tx_t tx, void *target) {
-  CHECK_TX(tx, false);
-
-  struct Region *reg = (struct Region *)shared;
+bool tm_free(shared_t unused(shared), tx_t tx, void *target)
+{
+  struct Transaction *tr = (struct Transaction *)tx;
   uintptr_t index = SEGMENT_INDEX(target);
 
-  free(reg->segments[index]);
-  free(reg->segments_copy[index]);
-  free(reg->controls[index]);
+  // if (unlikely(tr->is_aborted))
+  // {
+  //   return false;
+  // }
 
-  // To indicate a free index
-  reg->segments[index] = NULL;
-  reg->segments_copy[index] = NULL;
-  reg->controls[index] = NULL;
+  // if (unlikely(index == 0))
+  // {
+  //   return false;
+  // }
 
+  // pthread_mutex_lock(&reg->batcher.free_lock);
+  insert_list(&tr->freed_segments, index, uintptr_t);
+  // pthread_mutex_unlock(&reg->batcher.free_lock);
   return true;
 }
