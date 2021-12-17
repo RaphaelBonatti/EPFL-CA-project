@@ -48,6 +48,8 @@
 #define ACS_FIRST_READ 0b001
 #define ACS_MORE_READ 0b101
 
+
+
 typedef atomic_size_t atomic_acs;
 typedef size_t acs;
 
@@ -118,3 +120,5 @@ void seg_free(shared_t shared, uintptr_t index);
 // void insert_segment_array(size_t **array, size_t *size, size_t *n,
 //                           size_t index);
 void commit(shared_t shared);
+
+void printBits(unsigned int num);

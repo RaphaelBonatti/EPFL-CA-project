@@ -8,6 +8,15 @@
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
+void printBits(unsigned int num)
+{
+   for(int bit=0;bit<(sizeof(unsigned int) * 8); bit++)
+   {
+      printf("%i ", num & 0x01);
+      num = num >> 1;
+   }
+}
+
 bool read_word(struct Region *reg, tx_t tx, void *target, size_t segment_index,
                size_t word_index, acs access_type_id) {
   struct Control *control = &reg->controls[segment_index][word_index];
@@ -23,6 +32,8 @@ bool read_word(struct Region *reg, tx_t tx, void *target, size_t segment_index,
 
   if (atomic_load(&control->access_type_id) == access_type_id) {
     memcpy(target, control->write_word, reg->align);
+
+    return true;
   }
 
   acs expected_acs = ACS_NULL;
